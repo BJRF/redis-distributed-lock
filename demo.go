@@ -12,9 +12,10 @@ import (
 var (
 	//go:embed unlock.lua
 	luaUnlock string
-
 	//go:embed refresh.lua
 	luaRefresh string
+	//go:embed lock.lua
+	luaLock string
 
 	ErrTryLockFail = errors.New("加锁失败")
 	ErrLockNotHold = errors.New("该用户未持有锁")
@@ -29,6 +30,48 @@ type Client struct {
 func NewClient(c redis.Cmdable) *Client {
 	return &Client{
 		client: c,
+	}
+}
+
+// Lock 带重试的锁
+func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration, retry RetryTool, timeout time.Duration) (*Lock, error) {
+	value := uuid.New().String()
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		// lctx 带timeout的WithTimeout新context
+		lctx, cancel := context.WithTimeout(ctx, timeout)
+		res, err := c.client.Eval(lctx, luaLock, []string{key}, value, expiration.Milliseconds()).Bool()
+		cancel()
+		// 如果超时
+		if err != nil && err != context.DeadlineExceeded {
+			return nil, err
+		}
+		// 加锁成功
+		if res {
+			return newLock(c.client, key, value, expiration), nil
+		}
+		// 根据重试策略判断是否重试
+		interval, ok := retry.Next()
+		if !ok {
+			return nil, ErrLockNotHold
+		}
+		//如果timer还没有定义
+		if timer == nil {
+			timer = time.NewTimer(interval)
+		}
+		//重置timer的间隔计时器
+		timer.Reset(interval)
+		select {
+		//超时
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
