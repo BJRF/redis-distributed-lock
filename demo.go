@@ -6,6 +6,7 @@ import (
 	"errors"
 	"github.com/go-redis/redis/v9"
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 	"time"
 )
 
@@ -24,12 +25,35 @@ var (
 // Client 客户端结构
 type Client struct {
 	client redis.Cmdable
+	s      singleflight.Group
 }
 
 // NewClient 建立新的客户端
 func NewClient(c redis.Cmdable) *Client {
 	return &Client{
 		client: c,
+	}
+}
+
+func (c *Client) SingleflightLock(ctx context.Context, key string, expiration time.Duration, retry RetryTool, timeout time.Duration) (*Lock, error) {
+	for {
+		flag := false
+		resCh := c.s.DoChan(key, func() (interface{}, error) {
+			flag = true
+			return c.Lock(ctx, key, expiration, retry, timeout)
+		})
+		select {
+		case res := <-resCh:
+			// flag确认是否是自己拿到锁
+			if flag {
+				if res.Err != nil {
+					return nil, res.Err
+				}
+				return res.Val.(*Lock), nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 
