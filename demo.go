@@ -11,7 +11,10 @@ import (
 
 var (
 	//go:embed unlock.lua
-	ualUnlock string
+	luaUnlock string
+
+	//go:embed refresh.lua
+	luaRefresh string
 
 	ErrTryLockFail = errors.New("加锁失败")
 	ErrLockNotHold = errors.New("该用户未持有锁")
@@ -51,6 +54,7 @@ type Lock struct {
 	key        string
 	value      string
 	expiration time.Duration
+	unlock     chan struct{}
 }
 
 // newLock new一个锁变量
@@ -60,18 +64,67 @@ func newLock(c redis.Cmdable, key string, value string, expiration time.Duration
 		key:        key,
 		value:      value,
 		expiration: expiration,
+		unlock:     make(chan struct{}, 1),
+	}
+}
+
+// AutoRefresh 自动续约
+func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error {
+	ch := make(chan struct{}, 1)
+	ticker := time.NewTicker(interval)
+	for {
+		select {
+		case <-ch:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
+			cancel()
+			if err == context.DeadlineExceeded {
+				ch <- struct{}{}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
+			cancel()
+			if err == context.DeadlineExceeded {
+				ch <- struct{}{}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-l.unlock:
+			return nil
+		}
+
 	}
 }
 
 // Refresh 续约分布式锁
-func Refresh(ctx context.Context) error {
+func (l *Lock) Refresh(ctx context.Context) error {
 	//lua脚本判断是不是自己的锁，如果是则刷新
-
+	res, err := l.client.Eval(ctx, luaRefresh, []string{l.key}, l.value, l.expiration.Milliseconds()).Int64()
+	if err == redis.Nil {
+		return ErrLockNotHold
+	}
+	if err != nil {
+		return err
+	}
+	if res == 1 {
+		return ErrTryLockFail
+	}
 	return nil
 }
 
 // Unlock 解锁
 func (l *Lock) Unlock(ctx context.Context, key string) error {
+	defer func() {
+		l.unlock <- struct{}{}
+	}()
+
 	////非原子操作，保证原子操作需要用到lua脚本
 	//val, err := l.client.Get(ctx, key).Result()
 	//if err != nil {
